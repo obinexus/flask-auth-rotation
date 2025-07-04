@@ -3,6 +3,10 @@ from flask import Flask, redirect, url_for, session, render_template
 from src.extensions import db
 from src.config import config
 
+import os
+os.environ['FLASK_ENV'] = 'development'
+
+# 
 def create_app(config_name='default'):
     """Create and configure Flask application"""
     app = Flask(__name__, 
@@ -71,5 +75,9 @@ def register_error_handlers(app):
         return "Internal server error", 500
 
 if __name__ == "__main__":
-    app = create_app()
+    # Force development configuration for local testing
+    import os
+    os.environ['FLASK_ENV'] = 'development'
+    
+    app = create_app('development')  # Explicitly use development config
     app.run(debug=True, host='0.0.0.0', port=5000)
