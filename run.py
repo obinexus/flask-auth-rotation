@@ -43,3 +43,7 @@ def register_error_handlers(app):
     def internal_error(error):
         db.session.rollback()
         return "Internal server error", 500
+
+if __name__ == "__main__":
+    app = create_app()
+    app.run(debug=True)
