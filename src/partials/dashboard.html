@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>User Dashboard</h2>
+<p>Welcome, <strong>{{ user.username }}</strong>!</p>
+
+<h3>Password Status</h3>
+<ul>
+    <li>Password created: {{ user.password_created.strftime('%Y-%m-%d') }}</li>
+    <li>Password expires: {{ user.password_expires.strftime('%Y-%m-%d') }}</li>
+    <li>Days until expiry: {{ user.days_until_expiry() }}</li>
+    <li>Status: 
+        {% if user.is_password_expired() %}
+            <span class="error">EXPIRED - Update Required</span>
+        {% elif user.days_until_expiry() < 30 %}
+            <span class="warning">Expiring Soon</span>
+        {% else %}
+            <span class="success">Active</span>
+        {% endif %}
+    </li>
+</ul>
+
+<h3>Account Information</h3>
+<ul>
+    <li>Account created: {{ user.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</li>
+    <li>Password history entries: {{ user.password_history|length }}</li>
+</ul>
+{% endblock %}

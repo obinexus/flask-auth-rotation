@@ -14,9 +14,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import Dict, Optional, Tuple
-
 import bcrypt
-from flask import Flask, render_template_string, request, redirect, url_for, flash, session, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import desc, func
 from dataclasses import dataclass
@@ -281,309 +280,7 @@ def api_auth_required(f):
         return response
     return decorated_function
 
-# HTML Templates (embedded for simplicity)
-BASE_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Aegis Authentication System</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; font-weight: bold; }
-        input[type="text"], input[type="password"], select { width: 100%; padding: 8px; box-sizing: border-box; }
-        button { background-color: #007bff; color: white; padding: 10px 20px; border: none; cursor: pointer; }
-        button:hover { background-color: #0056b3; }
-        .error { color: red; }
-        .success { color: green; }
-        .warning { color: orange; }
-        .info { background-color: #e7f3ff; padding: 10px; margin-bottom: 20px; border-left: 4px solid #2196F3; }
-        .navigation { margin-bottom: 20px; }
-        .navigation a { margin-right: 15px; }
-        .quota-info { background-color: #f0f0f0; padding: 10px; margin: 10px 0; border-radius: 5px; }
-        .api-key-display { font-family: monospace; background-color: #f5f5f5; padding: 5px; border: 1px solid #ddd; }
-        .metric-box { display: inline-block; padding: 10px; margin: 5px; background-color: #e8f5e9; border-radius: 5px; }
-        .partial-content { border: 1px solid #ddd; padding: 15px; margin: 10px 0; }
-    </style>
-    <script>
-        // Partial content loading
-        async function loadPartial(url, targetId) {
-            try {
-                const response = await fetch(url);
-                const data = await response.text();
-                document.getElementById(targetId).innerHTML = data;
-            } catch (error) {
-                console.error('Error loading partial:', error);
-            }
-        }
-        
-        // Auto-refresh quota metrics
-        function startQuotaRefresh() {
-            setInterval(() => {
-                loadPartial('/api/quota-status', 'quota-display');
-            }, 5000);
-        }
-    </script>
-</head>
-<body>
-    <h1>Aegis Authentication System</h1>
-    <div class="info">
-        <strong>CRUD Password Lifecycle Implementation</strong><br>
-        Based on Obinexus Computing specifications<br>
-        <em>Confio Zero-Trust Authentication with API Quota Management</em>
-    </div>
-    
-    <div class="navigation">
-        {% if session.get('user_id') %}
-            <a href="{{ url_for('dashboard') }}">Dashboard</a>
-            <a href="{{ url_for('api_dashboard') }}">API Access</a>
-            <a href="{{ url_for('update_password') }}">Change Password</a>
-            <a href="{{ url_for('logout') }}">Logout</a>
-            <a href="{{ url_for('delete_account') }}">Delete Account</a>
-        {% else %}
-            <a href="{{ url_for('login') }}">Login</a>
-            <a href="{{ url_for('register') }}">Register</a>
-        {% endif %}
-    </div>
-    
-    {% with messages = get_flashed_messages(with_categories=true) %}
-        {% if messages %}
-            {% for category, message in messages %}
-                <div class="{{ category }}">{{ message }}</div>
-            {% endfor %}
-        {% endif %}
-    {% endwith %}
-    
-    {% block content %}{% endblock %}
-</body>
-</html>
-"""
-
-REGISTER_TEMPLATE = """
-{% extends "base.html" %}
-{% block content %}
-<h2>CREATE: User Registration</h2>
-<p>Phase 1 of CRUD lifecycle - Secure credential creation with salting and hashing</p>
-<form method="POST">
-    <div class="form-group">
-        <label>Username:</label>
-        <input type="text" name="username" required>
-    </div>
-    <div class="form-group">
-        <label>Password:</label>
-        <input type="password" name="password" required minlength="{{ min_length }}">
-        <small>Minimum {{ min_length }} characters. Consider using a pattern like base+year (e.g., nna2001)</small>
-    </div>
-    <button type="submit">Register</button>
-</form>
-{% endblock %}
-"""
-
-LOGIN_TEMPLATE = """
-{% extends "base.html" %}
-{% block content %}
-<h2>READ: User Authentication</h2>
-<p>Phase 2 of CRUD lifecycle - Secure credential verification via hash comparison</p>
-<form method="POST">
-    <div class="form-group">
-        <label>Username:</label>
-        <input type="text" name="username" required>
-    </div>
-    <div class="form-group">
-        <label>Password:</label>
-        <input type="password" name="password" required>
-    </div>
-    <button type="submit">Login</button>
-</form>
-{% endblock %}
-"""
-
-DASHBOARD_TEMPLATE = """
-{% extends "base.html" %}
-{% block content %}
-<h2>User Dashboard</h2>
-<p>Welcome, <strong>{{ user.username }}</strong>!</p>
-
-<h3>Password Status</h3>
-<ul>
-    <li>Password created: {{ user.password_created.strftime('%Y-%m-%d') }}</li>
-    <li>Password expires: {{ user.password_expires.strftime('%Y-%m-%d') }}</li>
-    <li>Days until expiry: {{ user.days_until_expiry() }}</li>
-    <li>Status: 
-        {% if user.is_password_expired() %}
-            <span class="error">EXPIRED - Update Required</span>
-        {% elif user.days_until_expiry() < 30 %}
-            <span class="warning">Expiring Soon</span>
-        {% else %}
-            <span class="success">Active</span>
-        {% endif %}
-    </li>
-</ul>
-
-<h3>Account Information</h3>
-<ul>
-    <li>Account created: {{ user.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</li>
-    <li>Password history entries: {{ user.password_history|length }}</li>
-</ul>
-{% endblock %}
-"""
-
-UPDATE_PASSWORD_TEMPLATE = """
-{% extends "base.html" %}
-{% block content %}
-<h2>UPDATE: Password Rotation</h2>
-<p>Phase 3 of CRUD lifecycle - Annual password rotation with history enforcement</p>
-
-{% if user.is_password_expired() %}
-<div class="warning">
-    <strong>Your password has expired!</strong> Please update it to continue using your account securely.
-</div>
-{% endif %}
-
-<form method="POST">
-    <div class="form-group">
-        <label>Current Password:</label>
-        <input type="password" name="current_password" required>
-    </div>
-    <div class="form-group">
-        <label>New Password:</label>
-        <input type="password" name="new_password" required minlength="{{ min_length }}">
-        <small>Cannot reuse any of your last {{ history_count }} passwords. Consider incrementing your pattern (e.g., nna2001 → nna2002)</small>
-    </div>
-    <div class="form-group">
-        <label>Confirm New Password:</label>
-        <input type="password" name="confirm_password" required>
-    </div>
-    <button type="submit">Update Password</button>
-</form>
-{% endblock %}
-"""
-
-DELETE_ACCOUNT_TEMPLATE = """
-{% extends "base.html" %}
-{% block content %}
-<h2>DELETE: Account Deletion</h2>
-<p>Phase 4 of CRUD lifecycle - Secure credential and data removal</p>
-
-<div class="warning">
-    <strong>Warning:</strong> This action is permanent and will:
-    <ul>
-        <li>Delete your account credentials</li>
-        <li>Remove all password history</li>
-        <li>Invalidate all active sessions</li>
-        <li>Permanently remove your account data</li>
-    </ul>
-</div>
-
-<form method="POST">
-    <div class="form-group">
-        <label>Enter your password to confirm deletion:</label>
-        <input type="password" name="password" required>
-    </div>
-    <div class="form-group">
-        <label>Type "DELETE" to confirm:</label>
-        <input type="text" name="confirmation" required pattern="DELETE">
-    </div>
-    <button type="submit" onclick="return confirm('Are you absolutely sure? This cannot be undone.')">Delete Account</button>
-</form>
-{% endblock %}
-"""
-
-API_DASHBOARD_TEMPLATE = """
-{% extends "base.html" %}
-{% block content %}
-<h2>API Access Management</h2>
-<p>Tiered data access with quota enforcement per Confio Zero-Trust specifications</p>
-
-<div class="quota-info">
-    <h3>Current Tier: <strong>{{ user.api_tier|upper }}</strong></h3>
-    <div id="quota-display" class="partial-content">
-        <!-- Quota metrics loaded via partial rendering -->
-    </div>
-</div>
-
-<div class="api-key-section">
-    <h3>API Key Management</h3>
-    {% if user.api_key %}
-        <p>Current API Key:</p>
-        <div class="api-key-display">{{ user.api_key }}</div>
-        <p><small>Created: {{ user.api_key_created.strftime('%Y-%m-%d %H:%M:%S') if user.api_key_created else 'N/A' }}</small></p>
-    {% else %}
-        <p>No API key generated yet.</p>
-    {% endif %}
-    
-    <form method="POST" action="{{ url_for('generate_api_key') }}">
-        <button type="submit" onclick="return confirm('Generate new API key? This will invalidate your existing key.')">
-            Generate New API Key
-        </button>
-    </form>
-</div>
-
-<div class="tier-info">
-    <h3>Tier Limits</h3>
-    <table style="width: 100%; border-collapse: collapse;">
-        <tr>
-            <th style="border: 1px solid #ddd; padding: 8px;">Tier</th>
-            <th style="border: 1px solid #ddd; padding: 8px;">Requests/Hour</th>
-            <th style="border: 1px solid #ddd; padding: 8px;">Data Limit (MB)</th>
-        </tr>
-        {% for tier, limits in tier_limits.items() %}
-        <tr style="{% if tier == user.api_tier %}background-color: #e8f5e9;{% endif %}">
-            <td style="border: 1px solid #ddd; padding: 8px;">{{ tier|upper }}</td>
-            <td style="border: 1px solid #ddd; padding: 8px;">{{ limits.requests_per_hour }}</td>
-            <td style="border: 1px solid #ddd; padding: 8px;">{{ limits.data_limit_mb }}</td>
-        </tr>
-        {% endfor %}
-    </table>
-</div>
-
-<div class="api-usage">
-    <h3>Recent API Usage</h3>
-    <div id="api-logs">
-        {% if recent_logs %}
-        <table style="width: 100%; border-collapse: collapse;">
-            <tr>
-                <th style="border: 1px solid #ddd; padding: 8px;">Timestamp</th>
-                <th style="border: 1px solid #ddd; padding: 8px;">Endpoint</th>
-                <th style="border: 1px solid #ddd; padding: 8px;">Status</th>
-                <th style="border: 1px solid #ddd; padding: 8px;">Data (MB)</th>
-            </tr>
-            {% for log in recent_logs %}
-            <tr>
-                <td style="border: 1px solid #ddd; padding: 8px;">{{ log.timestamp.strftime('%Y-%m-%d %H:%M:%S') }}</td>
-                <td style="border: 1px solid #ddd; padding: 8px;">{{ log.endpoint }}</td>
-                <td style="border: 1px solid #ddd; padding: 8px;">{{ log.status_code }}</td>
-                <td style="border: 1px solid #ddd; padding: 8px;">{{ "%.2f"|format(log.data_size_mb) }}</td>
-            </tr>
-            {% endfor %}
-        </table>
-        {% else %}
-        <p>No API usage recorded yet.</p>
-        {% endif %}
-    </div>
-</div>
-
-<script>
-    // Start quota refresh when page loads
-    window.addEventListener('load', () => {
-        loadPartial('/api/quota-status', 'quota-display');
-        startQuotaRefresh();
-    });
-</script>
-{% endblock %}
-"""
-
-QUOTA_PARTIAL_TEMPLATE = """
-<div class="metric-box">
-    <strong>Requests This Hour:</strong> {{ metrics.requests_count }}
-</div>
-<div class="metric-box">
-    <strong>Data Consumed:</strong> {{ "%.2f"|format(metrics.data_consumed_mb) }} MB
-</div>
-<div class="metric-box">
-    <strong>Reset Time:</strong> {{ reset_time }}
-</div>
-"""
+# Create database tables
 
 # Routes
 @app.route('/')
@@ -635,7 +332,7 @@ def register():
             flash(f'Registration failed: {str(e)}', 'error')
             return redirect(url_for('register'))
     
-    return render_template_string(REGISTER_TEMPLATE, min_length=MIN_PASSWORD_LENGTH)
+    return render_template('partials/register.html', min_length=MIN_PASSWORD_LENGTH)
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -665,14 +362,14 @@ def login():
             flash('Invalid username or password', 'error')
             return redirect(url_for('login'))
     
-    return render_template_string(LOGIN_TEMPLATE)
+    return render_template('partials/login.html')
 
 @app.route('/dashboard')
 @login_required
 def dashboard():
     """User dashboard showing password status"""
     user = User.query.get(session['user_id'])
-    return render_template_string(DASHBOARD_TEMPLATE, user=user)
+    return render_template('partials/dashboard.html', user=user)
 
 @app.route('/update-password', methods=['GET', 'POST'])
 @login_required
@@ -725,10 +422,7 @@ def update_password():
             flash(f'Password update failed: {str(e)}', 'error')
             return redirect(url_for('update_password'))
     
-    return render_template_string(UPDATE_PASSWORD_TEMPLATE, 
-                                user=user,
-                                min_length=MIN_PASSWORD_LENGTH,
-                                history_count=PASSWORD_HISTORY_COUNT)
+    return render_template('partials/update_password.html', user=user, min_length=MIN_PASSWORD_LENGTH, history_count=PASSWORD_HISTORY_COUNT)
 
 @app.route('/delete-account', methods=['GET', 'POST'])
 @login_required
@@ -772,7 +466,7 @@ def delete_account():
             flash(f'Account deletion failed: {str(e)}', 'error')
             return redirect(url_for('delete_account'))
     
-    return render_template_string(DELETE_ACCOUNT_TEMPLATE, user=user)
+    return render_template('partials/delete_account.html', user=user)
 
 @app.route('/logout')
 def logout():
@@ -791,10 +485,7 @@ def api_dashboard():
                                    .limit(10)\
                                    .all()
     
-    return render_template_string(API_DASHBOARD_TEMPLATE,
-                                user=user,
-                                tier_limits=API_RATE_LIMITS,
-                                recent_logs=recent_logs)
+    return render_template('partials/api_dashboard.html', user=user, tier_limits=API_RATE_LIMITS, recent_logs=recent_logs)
 
 @app.route('/api/generate-key', methods=['POST'])
 @login_required
@@ -826,9 +517,7 @@ def quota_status():
     next_reset = last_reset + timedelta(hours=1)
     reset_time = next_reset.strftime('%H:%M:%S')
     
-    return render_template_string(QUOTA_PARTIAL_TEMPLATE,
-                                metrics=metrics,
-                                reset_time=reset_time)
+    return render_template('partials/quota_partial.html', metrics=metrics, reset_time=reset_time)
 
 # API Data Endpoints with Quota Enforcement
 @app.route('/api/v1/data/silo/<silo_id>')
@@ -978,21 +667,6 @@ def index_page():
     """
     return INDEX_TEMPLATE
 
-# Template context processor
-@app.context_processor
-def inject_base_template():
-    return dict(base_template=BASE_TEMPLATE)
-
-# Override template lookup to use our embedded templates
-original_render = render_template_string
-def render_template_string(template, **context):
-    if template in [REGISTER_TEMPLATE, LOGIN_TEMPLATE, DASHBOARD_TEMPLATE, 
-                   UPDATE_PASSWORD_TEMPLATE, DELETE_ACCOUNT_TEMPLATE,
-                   API_DASHBOARD_TEMPLATE, QUOTA_PARTIAL_TEMPLATE]:
-        template = template.replace('{% extends "base.html" %}', 
-                                  '{% extends base_template %}')
-        context['base_template'] = BASE_TEMPLATE
-    return original_render(template, **context)
 
 # CLI Commands for testing
 @app.cli.command()

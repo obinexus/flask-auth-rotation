@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>READ: User Authentication</h2>
+<p>Phase 2 of CRUD lifecycle - Secure credential verification via hash comparison</p>
+<form method="POST">
+    <div class="form-group">
+        <label>Username:</label>
+        <input type="text" name="username" required>
+    </div>
+    <div class="form-group">
+        <label>Password:</label>
+        <input type="password" name="password" required>
+    </div>
+    <button type="submit">Login</button>
+</form>
+{% endblock %}

@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>API Access Management</h2>
+<p>Tiered data access with quota enforcement per Confio Zero-Trust specifications</p>
+
+<div class="quota-info">
+    <h3>Current Tier: <strong>{{ user.api_tier|upper }}</strong></h3>
+    <div id="quota-display" class="partial-content">
+        <!-- Quota metrics loaded via partial rendering -->
+    </div>
+</div>
+
+<div class="api-key-section">
+    <h3>API Key Management</h3>
+    {% if user.api_key %}
+        <p>Current API Key:</p>
+        <div class="api-key-display">{{ user.api_key }}</div>
+        <p><small>Created: {{ user.api_key_created.strftime('%Y-%m-%d %H:%M:%S') if user.api_key_created else 'N/A' }}</small></p>
+    {% else %}
+        <p>No API key generated yet.</p>
+    {% endif %}
+    
+    <form method="POST" action="{{ url_for('generate_api_key') }}">
+        <button type="submit" onclick="return confirm('Generate new API key? This will invalidate your existing key.')">
+            Generate New API Key
+        </button>
+    </form>
+</div>
+
+<div class="tier-info">
+    <h3>Tier Limits</h3>
+    <table style="width: 100%; border-collapse: collapse;">
+        <tr>
+            <th style="border: 1px solid #ddd; padding: 8px;">Tier</th>
+            <th style="border: 1px solid #ddd; padding: 8px;">Requests/Hour</th>
+            <th style="border: 1px solid #ddd; padding: 8px;">Data Limit (MB)</th>
+        </tr>
+        {% for tier, limits in tier_limits.items() %}
+        <tr style="{% if tier == user.api_tier %}background-color: #e8f5e9;{% endif %}">
+            <td style="border: 1px solid #ddd; padding: 8px;">{{ tier|upper }}</td>
+            <td style="border: 1px solid #ddd; padding: 8px;">{{ limits.requests_per_hour }}</td>
+            <td style="border: 1px solid #ddd; padding: 8px;">{{ limits.data_limit_mb }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+</div>
+
+<div class="api-usage">
+    <h3>Recent API Usage</h3>
+    <div id="api-logs">
+        {% if recent_logs %}
+        <table style="width: 100%; border-collapse: collapse;">
+            <tr>
+                <th style="border: 1px solid #ddd; padding: 8px;">Timestamp</th>
+                <th style="border: 1px solid #ddd; padding: 8px;">Endpoint</th>
+                <th style="border: 1px solid #ddd; padding: 8px;">Status</th>
+                <th style="border: 1px solid #ddd; padding: 8px;">Data (MB)</th>
+            </tr>
+            {% for log in recent_logs %}
+            <tr>
+                <td style="border: 1px solid #ddd; padding: 8px;">{{ log.timestamp.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+                <td style="border: 1px solid #ddd; padding: 8px;">{{ log.endpoint }}</td>
+                <td style="border: 1px solid #ddd; padding: 8px;">{{ log.status_code }}</td>
+                <td style="border: 1px solid #ddd; padding: 8px;">{{ "%.2f"|format(log.data_size_mb) }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+        <p>No API usage recorded yet.</p>
+        {% endif %}
+    </div>
+</div>
+
+<script>
+    // Start quota refresh when page loads
+    window.addEventListener('load', () => {
+        loadPartial('/api/quota-status', 'quota-display');
+        startQuotaRefresh();
+    });
+</script>
+{% endblock %}

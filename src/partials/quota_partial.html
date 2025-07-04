@@ -1,0 +1,9 @@
+<div class="metric-box">
+    <strong>Requests This Hour:</strong> {{ metrics.requests_count }}
+</div>
+<div class="metric-box">
+    <strong>Data Consumed:</strong> {{ "%.2f"|format(metrics.data_consumed_mb) }} MB
+</div>
+<div class="metric-box">
+    <strong>Reset Time:</strong> {{ reset_time }}
+</div>

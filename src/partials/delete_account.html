@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>DELETE: Account Deletion</h2>
+<p>Phase 4 of CRUD lifecycle - Secure credential and data removal</p>
+
+<div class="warning">
+    <strong>Warning:</strong> This action is permanent and will:
+    <ul>
+        <li>Delete your account credentials</li>
+        <li>Remove all password history</li>
+        <li>Invalidate all active sessions</li>
+        <li>Permanently remove your account data</li>
+    </ul>
+</div>
+
+<form method="POST">
+    <div class="form-group">
+        <label>Enter your password to confirm deletion:</label>
+        <input type="password" name="password" required>
+    </div>
+    <div class="form-group">
+        <label>Type "DELETE" to confirm:</label>
+        <input type="text" name="confirmation" required pattern="DELETE">
+    </div>
+    <button type="submit" onclick="return confirm('Are you absolutely sure? This cannot be undone.')">Delete Account</button>
+</form>
+{% endblock %}
