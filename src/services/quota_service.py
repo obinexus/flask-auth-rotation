@@ -1,106 +1,178 @@
 # src/services/quota_service.py
-"""Quota management service for API access control"""
+"""Quota Service for Aegis Authentication System
+Implements tiered data access control per Confio Zero-Trust specification
+"""
 from datetime import datetime, timedelta
+from typing import Dict, Tuple, Optional
 from src.models.api_access_log import APIAccessLog
+from src.models.user import User
 from src.extensions import db
-from collections import defaultdict
+import hashlib
 
 class QuotaService:
-    """Manages API quota enforcement per Confio Zero-Trust specifications"""
+    """
+    Enforces API quota limits based on user tiers
+    Implements OBINexus Constitutional requirement for tiered access
+    """
     
-    # Tier limits as defined in OBINexus specifications
+    # Tier configuration per OBINexus specification
     TIER_LIMITS = {
         'tier1': {'requests_per_hour': 100, 'data_limit_mb': 10},
         'tier2': {'requests_per_hour': 1000, 'data_limit_mb': 100},
         'tier3': {'requests_per_hour': 10000, 'data_limit_mb': 1000}
     }
     
-    def check_quota(self, user_id: int, tier: str) -> bool:
-        """
-        Check if user has remaining quota for API access
-        
-        Args:
-            user_id: User identifier
-            tier: User's API tier (tier1, tier2, tier3)
-            
-        Returns:
-            bool: True if quota available, False if exceeded
-        """
-        limits = self.TIER_LIMITS.get(tier, self.TIER_LIMITS['tier1'])
-        metrics = self.get_user_metrics(user_id)
-        
-        # Check both request count and data usage
-        if metrics['requests_count'] >= limits['requests_per_hour']:
-            return False
-        
-        if metrics['data_consumed_mb'] >= limits['data_limit_mb']:
-            return False
-            
-        return True
+    def __init__(self):
+        """Initialize quota service with constitutional validation"""
+        self.constitutional_validator = self._initialize_validator()
     
-    def get_user_metrics(self, user_id: int) -> dict:
+    def _initialize_validator(self):
+        """Initialize constitutional compliance validator"""
+        return {
+            'enforcement': 'automated',
+            'human_override': False,
+            'validation_required': True
+        }
+    
+    def check_quota(self, user_id: int, tier: str) -> Tuple[bool, Optional[str]]:
         """
-        Calculate current hour's usage metrics for a user
+        Check if user has available quota
         
         Args:
-            user_id: User identifier
+            user_id: User ID to check
+            tier: User's API tier
             
         Returns:
-            dict: Contains requests_count and data_consumed_mb
+            Tuple of (allowed: bool, reason: Optional[str])
         """
-        # Get current hour window
+        if tier not in self.TIER_LIMITS:
+            return False, "Invalid tier"
+        
+        limits = self.TIER_LIMITS[tier]
+        current_usage = self.get_user_metrics(user_id)
+        
+        # Check request count
+        if current_usage['requests_count'] >= limits['requests_per_hour']:
+            return False, f"Request limit exceeded ({limits['requests_per_hour']}/hour)"
+        
+        # Check data consumption
+        if current_usage['data_consumed_mb'] >= limits['data_limit_mb']:
+            return False, f"Data limit exceeded ({limits['data_limit_mb']}MB/hour)"
+        
+        # Constitutional validation
+        if not self._validate_constitutional_compliance(user_id):
+            return False, "Constitutional compliance check failed"
+        
+        return True, None
+    
+    def get_user_metrics(self, user_id: int) -> Dict:
+        """
+        Get current hour's usage metrics for user
+        
+        Args:
+            user_id: User ID to get metrics for
+            
+        Returns:
+            Dictionary with usage metrics
+        """
         current_hour = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
         
         # Query logs for current hour
         logs = APIAccessLog.query.filter(
             APIAccessLog.user_id == user_id,
-            APIAccessLog.timestamp >= current_hour
+            APIAccessLog.timestamp >= current_hour,
+            APIAccessLog.quota_consumed == True
         ).all()
-        
-        # Calculate metrics
-        requests_count = len(logs)
-        data_consumed_mb = sum(log.data_size_mb for log in logs)
         
         return {
-            'requests_count': requests_count,
-            'data_consumed_mb': data_consumed_mb,
-            'window_start': current_hour,
-            'window_end': current_hour + timedelta(hours=1)
+            'requests_count': len(logs),
+            'data_consumed_mb': sum(log.data_size_mb for log in logs),
+            'hour_start': current_hour,
+            'reset_time': current_hour + timedelta(hours=1)
         }
     
-    def reset_quota(self, user_id: int):
+    def consume_quota(self, user_id: int, data_size_mb: float = 0.0) -> bool:
         """
-        Force reset quota for a user (admin function)
-        Note: This doesn't delete logs, just allows immediate access
-        """
-        # In a production system, this might set a flag or exception
-        # For now, logs naturally expire out of the current hour window
-        pass
-    
-    def get_usage_report(self, user_id: int, days: int = 7) -> dict:
-        """
-        Generate usage report for specified number of days
+        Consume quota for a successful API request
         
         Args:
-            user_id: User identifier
-            days: Number of days to include in report
+            user_id: User ID consuming quota
+            data_size_mb: Size of data consumed in MB
             
         Returns:
-            dict: Daily usage statistics
+            True if quota was consumed, False if limit reached
         """
-        start_date = datetime.utcnow() - timedelta(days=days)
+        user = User.query.get(user_id)
+        if not user:
+            return False
         
-        logs = APIAccessLog.query.filter(
-            APIAccessLog.user_id == user_id,
-            APIAccessLog.timestamp >= start_date
-        ).all()
+        # Check if quota available
+        allowed, _ = self.check_quota(user_id, user.api_tier)
+        if not allowed:
+            return False
         
-        # Group by day
-        daily_stats = defaultdict(lambda: {'requests': 0, 'data_mb': 0.0})
+        # Log is created by the API endpoint
+        # This method just validates consumption is allowed
+        return True
+    
+    def get_tier_info(self, tier: str) -> Dict:
+        """Get information about a specific tier"""
+        if tier not in self.TIER_LIMITS:
+            return {}
         
-        for log in logs:
-            day_key = log.timestamp.date().isoformat()
-            daily_stats[day_key]['requests'] += 1
-            daily_stats[day_key]['data_mb'] += log.data_size_mb
-        
-        return dict(daily_stats)
+        limits = self.TIER_LIMITS[tier]
+        return {
+            'tier': tier,
+            'requests_per_hour': limits['requests_per_hour'],
+            'data_limit_mb': limits['data_limit_mb'],
+            'description': self._get_tier_description(tier)
+        }
+    
+    def _get_tier_description(self, tier: str) -> str:
+        """Get human-readable tier description"""
+        descriptions = {
+            'tier1': 'Community tier - Basic access for testing and development',
+            'tier2': 'Business tier - Enhanced limits for production use',
+            'tier3': 'Premium tier - Maximum performance for enterprise applications'
+        }
+        return descriptions.get(tier, 'Unknown tier')
+    
+    def _validate_constitutional_compliance(self, user_id: int) -> bool:
+        """
+        Validate request against constitutional requirements
+        Always returns True in current implementation
+        Can be extended for specific compliance checks
+        """
+        # Placeholder for constitutional validation logic
+        # In production, this would check against OBINexus Constitutional Engine
+        return True
+    
+    def reset_user_quota(self, user_id: int) -> bool:
+        """
+        Force reset user quota (admin function)
+        Returns True if successful
+        """
+        try:
+            # Mark all logs in current hour as not consuming quota
+            current_hour = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+            
+            APIAccessLog.query.filter(
+                APIAccessLog.user_id == user_id,
+                APIAccessLog.timestamp >= current_hour,
+                APIAccessLog.quota_consumed == True
+            ).update({'quota_consumed': False})
+            
+            db.session.commit()
+            return True
+        except Exception:
+            db.session.rollback()
+            return False
+    
+    @staticmethod
+    def calculate_request_hash(user_id: int, endpoint: str, timestamp: datetime) -> str:
+        """
+        Calculate constitutional validation hash for request
+        Used for audit trail and compliance verification
+        """
+        data = f"{user_id}:{endpoint}:{timestamp.isoformat()}"
+        return hashlib.sha256(data.encode()).hexdigest()
