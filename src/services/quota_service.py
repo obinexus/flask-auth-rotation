@@ -9,6 +9,34 @@ from src.models.user import User
 from src.extensions import db
 import hashlib
 
+
+lass QuotaService:
+    """Manages API quota enforcement per Confio specification"""
+    
+    TIER_LIMITS = {
+        'tier1': {'requests_per_hour': 100, 'data_limit_mb': 10},
+        'tier2': {'requests_per_hour': 1000, 'data_limit_mb': 100},
+        'tier3': {'requests_per_hour': 10000, 'data_limit_mb': 1000}
+    }
+    
+    def check_quota(self, user_id: int, tier: str) -> bool:
+        """Check if user has remaining quota"""
+        current_hour = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+        
+        # Count requests in current hour
+        request_count = APIAccessLog.query.filter(
+            APIAccessLog.user_id == user_id,
+            APIAccessLog.timestamp >= current_hour,
+            APIAccessLog.quota_consumed == True
+        ).count()
+        
+        limit = self.TIER_LIMITS.get(tier, {}).get('requests_per_hour', 0)
+        return request_count < limit
+    
+    def get_user_metrics(self, user_id: int) -> dict:
+        """Get current usage metrics for user"""
+        return APIAccessLog.get_hourly_usage(user_id, 'tier1')
+Phase 4: Template Path Correction
 class QuotaService:
     """
     Enforces API quota limits based on user tiers
