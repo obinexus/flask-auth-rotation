@@ -8,13 +8,19 @@ Based on: Password Rotation and CRUD-Based Authentication Management Scheme by N
 
 import os
 import secrets
+import threading
+import time
+from collections import defaultdict
 from datetime import datetime, timedelta
 from functools import wraps
+from typing import Dict, Optional, Tuple
 
 import bcrypt
-from flask import Flask, render_template_string, request, redirect, url_for, flash, session
+from flask import Flask, render_template_string, request, redirect, url_for, flash, session, jsonify
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import desc
+from sqlalchemy import desc, func
+from dataclasses import dataclass
+import requests
 
 # Initialize Flask application
 app = Flask(__name__)
@@ -28,11 +34,84 @@ PASSWORD_EXPIRY_DAYS = 365  # Annual rotation as per white paper
 PASSWORD_HISTORY_COUNT = 5  # Number of previous passwords to track
 MIN_PASSWORD_LENGTH = 8
 
+# API Quota Configuration
+API_RATE_LIMITS = {
+    'tier1': {'requests_per_hour': 100, 'data_limit_mb': 10},
+    'tier2': {'requests_per_hour': 1000, 'data_limit_mb': 100},
+    'tier3': {'requests_per_hour': 10000, 'data_limit_mb': 1000}
+}
+
 db = SQLAlchemy(app)
+
+# Thread-safe quota management
+@dataclass
+class QuotaMetric:
+    """Thread-safe metric tracking for API quota enforcement"""
+    requests_count: int = 0
+    data_consumed_mb: float = 0.0
+    last_reset: datetime = None
+    
+    def __post_init__(self):
+        self.last_reset = datetime.utcnow()
+        self._lock = threading.Lock()
+    
+    def increment(self, data_mb: float = 0.0) -> Tuple[bool, str]:
+        """Atomically increment metrics and check limits"""
+        with self._lock:
+            self.requests_count += 1
+            self.data_consumed_mb += data_mb
+            return True, "OK"
+    
+    def reset_if_needed(self) -> None:
+        """Reset metrics if hour has passed"""
+        with self._lock:
+            now = datetime.utcnow()
+            if (now - self.last_reset).total_seconds() >= 3600:
+                self.requests_count = 0
+                self.data_consumed_mb = 0.0
+                self.last_reset = now
+
+class QuotaManager:
+    """Manages API quotas with thread-safe operations"""
+    def __init__(self):
+        self._user_metrics: Dict[int, QuotaMetric] = defaultdict(QuotaMetric)
+        self._global_lock = threading.RLock()
+    
+    def check_and_update_quota(self, user_id: int, tier: str, data_mb: float = 0.0) -> Tuple[bool, str]:
+        """Check if user can make request and update metrics"""
+        with self._global_lock:
+            metric = self._user_metrics[user_id]
+            metric.reset_if_needed()
+            
+            limits = API_RATE_LIMITS.get(tier, API_RATE_LIMITS['tier1'])
+            
+            # Check limits before incrementing
+            if metric.requests_count >= limits['requests_per_hour']:
+                return False, "Hourly request limit exceeded"
+            
+            if metric.data_consumed_mb + data_mb > limits['data_limit_mb']:
+                return False, "Data transfer limit exceeded"
+            
+            # Update metrics
+            return metric.increment(data_mb)
+    
+    def get_user_metrics(self, user_id: int) -> dict:
+        """Get current metrics for user"""
+        with self._global_lock:
+            metric = self._user_metrics[user_id]
+            metric.reset_if_needed()
+            return {
+                'requests_count': metric.requests_count,
+                'data_consumed_mb': metric.data_consumed_mb,
+                'last_reset': metric.last_reset.isoformat()
+            }
+
+# Initialize quota manager
+quota_manager = QuotaManager()
 
 # Database Models
 class User(db.Model):
-    """User model implementing secure credential storage"""
+    """User model implementing secure credential storage with API access tiers"""
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(256), nullable=False)
@@ -42,8 +121,14 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     is_active = db.Column(db.Boolean, default=True)
     
+    # API Access Tier Management
+    api_tier = db.Column(db.String(20), default='tier1')
+    api_key = db.Column(db.String(256), unique=True, nullable=True)
+    api_key_created = db.Column(db.DateTime, nullable=True)
+    
     # Relationship to password history
     password_history = db.relationship('PasswordHistory', backref='user', lazy=True, cascade='all, delete-orphan')
+    api_access_logs = db.relationship('APIAccessLog', backref='user', lazy=True, cascade='all, delete-orphan')
     
     def __repr__(self):
         return f'<User {self.username}>'
@@ -56,6 +141,12 @@ class User(db.Model):
         """Calculate days until password expiration"""
         delta = self.password_expires - datetime.utcnow()
         return delta.days if delta.days > 0 else 0
+    
+    def generate_api_key(self):
+        """Generate new API key for user"""
+        self.api_key = secrets.token_urlsafe(32)
+        self.api_key_created = datetime.utcnow()
+        return self.api_key
 
 class PasswordHistory(db.Model):
     """Track historical passwords to prevent reuse"""
@@ -67,6 +158,20 @@ class PasswordHistory(db.Model):
     
     def __repr__(self):
         return f'<PasswordHistory for user_id={self.user_id}>'
+
+class APIAccessLog(db.Model):
+    """Track API access for audit and quota enforcement"""
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    endpoint = db.Column(db.String(256), nullable=False)
+    method = db.Column(db.String(10), nullable=False)
+    status_code = db.Column(db.Integer, nullable=False)
+    data_size_mb = db.Column(db.Float, default=0.0)
+    timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    ip_address = db.Column(db.String(45), nullable=True)
+    
+    def __repr__(self):
+        return f'<APIAccessLog user_id={self.user_id} endpoint={self.endpoint}>'
 
 # Security Functions
 def generate_salt():
@@ -135,6 +240,47 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+def api_auth_required(f):
+    """Decorator for API authentication and quota enforcement"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        api_key = request.headers.get('X-API-Key') or request.args.get('api_key')
+        
+        if not api_key:
+            return jsonify({'error': 'API key required'}), 401
+        
+        user = User.query.filter_by(api_key=api_key, is_active=True).first()
+        if not user:
+            return jsonify({'error': 'Invalid API key'}), 401
+        
+        # Check quota
+        data_size = float(request.headers.get('Content-Length', 0)) / (1024 * 1024)  # Convert to MB
+        allowed, message = quota_manager.check_and_update_quota(user.id, user.api_tier, data_size)
+        
+        if not allowed:
+            return jsonify({'error': message, 'tier': user.api_tier}), 429
+        
+        # Set user context for the request
+        request.current_user = user
+        
+        # Log API access
+        response = f(*args, **kwargs)
+        
+        # Log after successful response
+        log_entry = APIAccessLog(
+            user_id=user.id,
+            endpoint=request.endpoint or request.path,
+            method=request.method,
+            status_code=response[1] if isinstance(response, tuple) else 200,
+            data_size_mb=data_size,
+            ip_address=request.remote_addr
+        )
+        db.session.add(log_entry)
+        db.session.commit()
+        
+        return response
+    return decorated_function
+
 # HTML Templates (embedded for simplicity)
 BASE_TEMPLATE = """
 <!DOCTYPE html>
@@ -145,7 +291,7 @@ BASE_TEMPLATE = """
         body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; font-weight: bold; }
-        input[type="text"], input[type="password"] { width: 100%; padding: 8px; box-sizing: border-box; }
+        input[type="text"], input[type="password"], select { width: 100%; padding: 8px; box-sizing: border-box; }
         button { background-color: #007bff; color: white; padding: 10px 20px; border: none; cursor: pointer; }
         button:hover { background-color: #0056b3; }
         .error { color: red; }
@@ -154,18 +300,43 @@ BASE_TEMPLATE = """
         .info { background-color: #e7f3ff; padding: 10px; margin-bottom: 20px; border-left: 4px solid #2196F3; }
         .navigation { margin-bottom: 20px; }
         .navigation a { margin-right: 15px; }
+        .quota-info { background-color: #f0f0f0; padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .api-key-display { font-family: monospace; background-color: #f5f5f5; padding: 5px; border: 1px solid #ddd; }
+        .metric-box { display: inline-block; padding: 10px; margin: 5px; background-color: #e8f5e9; border-radius: 5px; }
+        .partial-content { border: 1px solid #ddd; padding: 15px; margin: 10px 0; }
     </style>
+    <script>
+        // Partial content loading
+        async function loadPartial(url, targetId) {
+            try {
+                const response = await fetch(url);
+                const data = await response.text();
+                document.getElementById(targetId).innerHTML = data;
+            } catch (error) {
+                console.error('Error loading partial:', error);
+            }
+        }
+        
+        // Auto-refresh quota metrics
+        function startQuotaRefresh() {
+            setInterval(() => {
+                loadPartial('/api/quota-status', 'quota-display');
+            }, 5000);
+        }
+    </script>
 </head>
 <body>
     <h1>Aegis Authentication System</h1>
     <div class="info">
         <strong>CRUD Password Lifecycle Implementation</strong><br>
-        Based on Obinexus Computing specifications
+        Based on Obinexus Computing specifications<br>
+        <em>Confio Zero-Trust Authentication with API Quota Management</em>
     </div>
     
     <div class="navigation">
         {% if session.get('user_id') %}
             <a href="{{ url_for('dashboard') }}">Dashboard</a>
+            <a href="{{ url_for('api_dashboard') }}">API Access</a>
             <a href="{{ url_for('update_password') }}">Change Password</a>
             <a href="{{ url_for('logout') }}">Logout</a>
             <a href="{{ url_for('delete_account') }}">Delete Account</a>
@@ -318,11 +489,107 @@ DELETE_ACCOUNT_TEMPLATE = """
 {% endblock %}
 """
 
+API_DASHBOARD_TEMPLATE = """
+{% extends "base.html" %}
+{% block content %}
+<h2>API Access Management</h2>
+<p>Tiered data access with quota enforcement per Confio Zero-Trust specifications</p>
+
+<div class="quota-info">
+    <h3>Current Tier: <strong>{{ user.api_tier|upper }}</strong></h3>
+    <div id="quota-display" class="partial-content">
+        <!-- Quota metrics loaded via partial rendering -->
+    </div>
+</div>
+
+<div class="api-key-section">
+    <h3>API Key Management</h3>
+    {% if user.api_key %}
+        <p>Current API Key:</p>
+        <div class="api-key-display">{{ user.api_key }}</div>
+        <p><small>Created: {{ user.api_key_created.strftime('%Y-%m-%d %H:%M:%S') if user.api_key_created else 'N/A' }}</small></p>
+    {% else %}
+        <p>No API key generated yet.</p>
+    {% endif %}
+    
+    <form method="POST" action="{{ url_for('generate_api_key') }}">
+        <button type="submit" onclick="return confirm('Generate new API key? This will invalidate your existing key.')">
+            Generate New API Key
+        </button>
+    </form>
+</div>
+
+<div class="tier-info">
+    <h3>Tier Limits</h3>
+    <table style="width: 100%; border-collapse: collapse;">
+        <tr>
+            <th style="border: 1px solid #ddd; padding: 8px;">Tier</th>
+            <th style="border: 1px solid #ddd; padding: 8px;">Requests/Hour</th>
+            <th style="border: 1px solid #ddd; padding: 8px;">Data Limit (MB)</th>
+        </tr>
+        {% for tier, limits in tier_limits.items() %}
+        <tr style="{% if tier == user.api_tier %}background-color: #e8f5e9;{% endif %}">
+            <td style="border: 1px solid #ddd; padding: 8px;">{{ tier|upper }}</td>
+            <td style="border: 1px solid #ddd; padding: 8px;">{{ limits.requests_per_hour }}</td>
+            <td style="border: 1px solid #ddd; padding: 8px;">{{ limits.data_limit_mb }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+</div>
+
+<div class="api-usage">
+    <h3>Recent API Usage</h3>
+    <div id="api-logs">
+        {% if recent_logs %}
+        <table style="width: 100%; border-collapse: collapse;">
+            <tr>
+                <th style="border: 1px solid #ddd; padding: 8px;">Timestamp</th>
+                <th style="border: 1px solid #ddd; padding: 8px;">Endpoint</th>
+                <th style="border: 1px solid #ddd; padding: 8px;">Status</th>
+                <th style="border: 1px solid #ddd; padding: 8px;">Data (MB)</th>
+            </tr>
+            {% for log in recent_logs %}
+            <tr>
+                <td style="border: 1px solid #ddd; padding: 8px;">{{ log.timestamp.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+                <td style="border: 1px solid #ddd; padding: 8px;">{{ log.endpoint }}</td>
+                <td style="border: 1px solid #ddd; padding: 8px;">{{ log.status_code }}</td>
+                <td style="border: 1px solid #ddd; padding: 8px;">{{ "%.2f"|format(log.data_size_mb) }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+        <p>No API usage recorded yet.</p>
+        {% endif %}
+    </div>
+</div>
+
+<script>
+    // Start quota refresh when page loads
+    window.addEventListener('load', () => {
+        loadPartial('/api/quota-status', 'quota-display');
+        startQuotaRefresh();
+    });
+</script>
+{% endblock %}
+"""
+
+QUOTA_PARTIAL_TEMPLATE = """
+<div class="metric-box">
+    <strong>Requests This Hour:</strong> {{ metrics.requests_count }}
+</div>
+<div class="metric-box">
+    <strong>Data Consumed:</strong> {{ "%.2f"|format(metrics.data_consumed_mb) }} MB
+</div>
+<div class="metric-box">
+    <strong>Reset Time:</strong> {{ reset_time }}
+</div>
+"""
+
 # Routes
 @app.route('/')
 def index():
     """Landing page"""
-    return redirect(url_for('dashboard') if 'user_id' in session else url_for('login'))
+    return redirect(url_for('index_page'))
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
@@ -514,6 +781,203 @@ def logout():
     flash('Logged out successfully', 'success')
     return redirect(url_for('login'))
 
+@app.route('/api/dashboard')
+@login_required
+def api_dashboard():
+    """API management dashboard"""
+    user = User.query.get(session['user_id'])
+    recent_logs = APIAccessLog.query.filter_by(user_id=user.id)\
+                                   .order_by(desc(APIAccessLog.timestamp))\
+                                   .limit(10)\
+                                   .all()
+    
+    return render_template_string(API_DASHBOARD_TEMPLATE,
+                                user=user,
+                                tier_limits=API_RATE_LIMITS,
+                                recent_logs=recent_logs)
+
+@app.route('/api/generate-key', methods=['POST'])
+@login_required
+def generate_api_key():
+    """Generate new API key for user"""
+    user = User.query.get(session['user_id'])
+    
+    try:
+        # Generate new key
+        new_key = user.generate_api_key()
+        db.session.commit()
+        
+        flash(f'New API key generated successfully!', 'success')
+    except Exception as e:
+        db.session.rollback()
+        flash(f'Failed to generate API key: {str(e)}', 'error')
+    
+    return redirect(url_for('api_dashboard'))
+
+@app.route('/api/quota-status')
+@login_required
+def quota_status():
+    """Get current quota status (partial rendering endpoint)"""
+    user = User.query.get(session['user_id'])
+    metrics = quota_manager.get_user_metrics(user.id)
+    
+    # Calculate time until reset
+    last_reset = datetime.fromisoformat(metrics['last_reset'])
+    next_reset = last_reset + timedelta(hours=1)
+    reset_time = next_reset.strftime('%H:%M:%S')
+    
+    return render_template_string(QUOTA_PARTIAL_TEMPLATE,
+                                metrics=metrics,
+                                reset_time=reset_time)
+
+# API Data Endpoints with Quota Enforcement
+@app.route('/api/v1/data/silo/<silo_id>')
+@api_auth_required
+def api_silo_request(silo_id):
+    """Silo data request endpoint with quota enforcement"""
+    # Simulate data retrieval with size calculation
+    sample_data = {
+        'silo_id': silo_id,
+        'timestamp': datetime.utcnow().isoformat(),
+        'data': {
+            'metrics': {
+                'temperature': 22.5,
+                'humidity': 45.2,
+                'pressure': 1013.25
+            },
+            'status': 'operational',
+            'tier': request.current_user.api_tier
+        }
+    }
+    
+    return jsonify(sample_data), 200
+
+@app.route('/api/v1/data/aggregate', methods=['POST'])
+@api_auth_required
+def api_aggregate_data():
+    """Aggregate data endpoint for tier 2+ users"""
+    if request.current_user.api_tier == 'tier1':
+        return jsonify({'error': 'Aggregate queries require tier2 or higher'}), 403
+    
+    # Parse request data
+    query_params = request.get_json() or {}
+    
+    # Simulate aggregation
+    result = {
+        'query': query_params,
+        'results': {
+            'total_records': 1000,
+            'aggregations': {
+                'avg_temperature': 23.4,
+                'max_humidity': 78.9,
+                'min_pressure': 1008.5
+            }
+        },
+        'execution_time_ms': 145
+    }
+    
+    return jsonify(result), 200
+
+@app.route('/api/v1/data/stream/<stream_id>')
+@api_auth_required
+def api_stream_data(stream_id):
+    """Stream data endpoint for tier 3 users only"""
+    if request.current_user.api_tier != 'tier3':
+        return jsonify({'error': 'Stream access requires tier3'}), 403
+    
+    # Simulate stream data
+    stream_data = {
+        'stream_id': stream_id,
+        'batch_size': 100,
+        'data_points': [
+            {'t': i, 'v': 20 + (i % 10)} for i in range(100)
+        ]
+    }
+    
+    return jsonify(stream_data), 200
+
+# Index route with partial rendering
+@app.route('/index')
+def index_page():
+    """Root index with partial rendering support"""
+    INDEX_TEMPLATE = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Aegis Zero-Trust API Gateway</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 0; }
+            .header { background-color: #2c3e50; color: white; padding: 20px; text-align: center; }
+            .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+            .section { margin: 20px 0; padding: 20px; background-color: #f8f9fa; border-radius: 8px; }
+            .api-example { background-color: #e9ecef; padding: 10px; margin: 10px 0; font-family: monospace; }
+            .tier-card { display: inline-block; width: 30%; margin: 1%; padding: 20px; background-color: white; 
+                         border: 1px solid #dee2e6; border-radius: 8px; vertical-align: top; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>Aegis Zero-Trust API Gateway</h1>
+            <p>Confio Authentication System with Tiered Data Access</p>
+        </div>
+        
+        <div class="container">
+            <div class="section">
+                <h2>API Access Tiers</h2>
+                <div class="tier-card">
+                    <h3>Tier 1 - Basic</h3>
+                    <ul>
+                        <li>100 requests/hour</li>
+                        <li>10 MB data transfer</li>
+                        <li>Basic silo queries</li>
+                    </ul>
+                </div>
+                <div class="tier-card">
+                    <h3>Tier 2 - Professional</h3>
+                    <ul>
+                        <li>1,000 requests/hour</li>
+                        <li>100 MB data transfer</li>
+                        <li>Aggregate queries</li>
+                    </ul>
+                </div>
+                <div class="tier-card">
+                    <h3>Tier 3 - Enterprise</h3>
+                    <ul>
+                        <li>10,000 requests/hour</li>
+                        <li>1 GB data transfer</li>
+                        <li>Stream access</li>
+                    </ul>
+                </div>
+            </div>
+            
+            <div class="section">
+                <h2>API Usage Examples</h2>
+                <div class="api-example">
+                    GET /api/v1/data/silo/{silo_id}<br>
+                    Headers: X-API-Key: your-api-key
+                </div>
+                <div class="api-example">
+                    POST /api/v1/data/aggregate<br>
+                    Headers: X-API-Key: your-api-key<br>
+                    Body: {"filters": {...}, "aggregations": [...]}
+                </div>
+            </div>
+            
+            <div class="section">
+                <h2>Getting Started</h2>
+                <ol>
+                    <li><a href="/register">Register an account</a></li>
+                    <li><a href="/login">Login to your account</a></li>
+                    <li>Navigate to API Dashboard to generate your API key</li>
+                    <li>Use the API key in your requests</li>
+                </ol>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return INDEX_TEMPLATE
+
 # Template context processor
 @app.context_processor
 def inject_base_template():
@@ -523,7 +987,8 @@ def inject_base_template():
 original_render = render_template_string
 def render_template_string(template, **context):
     if template in [REGISTER_TEMPLATE, LOGIN_TEMPLATE, DASHBOARD_TEMPLATE, 
-                   UPDATE_PASSWORD_TEMPLATE, DELETE_ACCOUNT_TEMPLATE]:
+                   UPDATE_PASSWORD_TEMPLATE, DELETE_ACCOUNT_TEMPLATE,
+                   API_DASHBOARD_TEMPLATE, QUOTA_PARTIAL_TEMPLATE]:
         template = template.replace('{% extends "base.html" %}', 
                                   '{% extends base_template %}')
         context['base_template'] = BASE_TEMPLATE
