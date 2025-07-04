@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{% block title %}Aegis Authentication System{% endblock %}</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input[type="text"], input[type="password"], select { width: 100%; padding: 8px; box-sizing: border-box; }
+        button { background-color: #007bff; color: white; padding: 10px 20px; border: none; cursor: pointer; }
+        button:hover { background-color: #0056b3; }
+        .error { color: red; }
+        .success { color: green; }
+        .warning { color: orange; }
+        .info { background-color: #e7f3ff; padding: 10px; margin-bottom: 20px; border-left: 4px solid #2196F3; }
+        .navigation { margin-bottom: 20px; }
+        .navigation a { margin-right: 15px; }
+        .quota-info { background-color: #f0f0f0; padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .api-key-display { font-family: monospace; background-color: #f5f5f5; padding: 5px; border: 1px solid #ddd; }
+        .metric-box { display: inline-block; padding: 10px; margin: 5px; background-color: #e8f5e9; border-radius: 5px; }
+        .partial-content { border: 1px solid #ddd; padding: 15px; margin: 10px 0; }
+    </style>
+    {% block extra_head %}{% endblock %}
+</head>
+<body>
+    <h1>Aegis Authentication System</h1>
+    <div class="info">
+        <strong>CRUD Password Lifecycle Implementation</strong><br>
+        Based on Obinexus Computing specifications<br>
+        <em>Confio Zero-Trust Authentication with API Quota Management</em>
+    </div>
+    
+    <div class="navigation">
+        {% if session.get('user_id') %}
+            <a href="{{ url_for('dashboard.index') }}">Dashboard</a>
+            <a href="{{ url_for('api.dashboard') }}">API Access</a>
+            <a href="{{ url_for('auth.update_password') }}">Change Password</a>
+            <a href="{{ url_for('auth.logout') }}">Logout</a>
+            <a href="{{ url_for('auth.delete_account') }}">Delete Account</a>
+        {% else %}
+            <a href="{{ url_for('auth.login') }}">Login</a>
+            <a href="{{ url_for('auth.register') }}">Register</a>
+        {% endif %}
+    </div>
+    
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            {% for category, message in messages %}
+                <div class="{{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endif %}
+    {% endwith %}
+    
+    {% block content %}{% endblock %}
+    
+    {% block extra_scripts %}{% 
+endblock %} </body> </html>
